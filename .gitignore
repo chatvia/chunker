@@ -33,21 +33,21 @@ ENV/
 *.swo
 *~
 
-# Testing
+# Tooling
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
 .coverage
 htmlcov/
 
 # Environment variables
 .env
 .env.local
+!.env.example
 
 # Logs
 *.log
 logs/
-
-# Cache
-var/
 
 # OS
 .DS_Store
