@@ -56,7 +56,8 @@ repos:
 
       - id: actionlint
         name: actionlint
-        entry: uvx --from actionlint-py==1.7.12.25 actionlint
+        # With ShellCheck on PATH, actionlint also lints `run:` scripts (as on GitHub runners).
+        entry: uvx --with shellcheck-py==0.11.0.1 --from actionlint-py==1.7.12.25 actionlint
         language: system
         files: ^\.github/workflows/.*\.ya?ml$
 

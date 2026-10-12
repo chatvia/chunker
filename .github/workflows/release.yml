@@ -231,7 +231,16 @@ jobs:
           DIGEST: ${{ needs.publish-image.outputs.digest }}
         run: |
           version="${GITHUB_REF_NAME#v}"
-          notes="$(printf '## Docker\n\n```bash\ndocker pull %s:%s\n```\n\nDigest: `%s`\n' "$IMAGE" "$version" "$DIGEST")"
+          notes="$(cat <<EOF
+          ## Docker
+
+          \`\`\`bash
+          docker pull ${IMAGE}:${version}
+          \`\`\`
+
+          Digest: \`${DIGEST}\`
+          EOF
+          )"
           flags=(--title "$GITHUB_REF_NAME" --notes "$notes" --generate-notes --verify-tag)
           # Tags like v1.2.0-rc.1 are published as pre-releases.
           if [[ "$GITHUB_REF_NAME" == *-* ]]; then
