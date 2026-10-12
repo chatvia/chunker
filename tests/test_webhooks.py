@@ -1,13 +1,14 @@
 import asyncio
 import base64
 import json
+from collections.abc import Sequence
 
 import httpx
 import pytest
 
+from app.errors import UpstreamError
 from app.webhooks import WebhookSender, decode_secret, sign
 from tests.conftest import ClientFactory, FakeEmbedder
-from tests.documents import make_pdf
 
 SECRET = "whsec_" + base64.b64encode(b"0123456789abcdef0123456789abcdef").decode()
 
@@ -120,14 +121,27 @@ def test_async_text_job_posts_signed_result(
     assert data["chunks"][0]["embedding"]
 
 
-def test_async_file_job_reports_failures(make_client: ClientFactory) -> None:
+class FailingEmbedder(FakeEmbedder):
+    def embed(self, texts: Sequence[str]) -> list[list[float]]:
+        raise UpstreamError("Embeddings provider returned HTTP 503: unavailable")
+
+
+def test_async_job_reports_failures(make_client: ClientFactory) -> None:
     recorder = Recorder()
-    client = make_client(webhook_secret=SECRET, webhook_transport=httpx.MockTransport(recorder))
+    client = make_client(
+        embedder=FailingEmbedder(),
+        webhook_secret=SECRET,
+        webhook_transport=httpx.MockTransport(recorder),
+    )
 
     response = client.post(
-        "/v1/chunk/file",
-        files={"file": ("broken.pdf", b"%PDF-1.4 not really")},
-        data={"webhook_url": "https://example.test/hook", "metadata": '{"document_id": 7}'},
+        "/v1/chunk",
+        json={
+            "text": "Hello world.",
+            "embed": True,
+            "webhook_url": "https://example.test/hook",
+            "metadata": {"document_id": 7},
+        },
     )
 
     assert response.status_code == 202
@@ -136,24 +150,38 @@ def test_async_file_job_reports_failures(make_client: ClientFactory) -> None:
     assert event["data"] == {
         "job_id": response.json()["job_id"],
         "metadata": {"document_id": 7},
-        "error": {"status_code": 422, "message": event["data"]["error"]["message"]},  # type: ignore[index]
+        "error": {
+            "status_code": 502,
+            "message": "Embeddings provider returned HTTP 503: unavailable",
+        },
     }
 
 
-def test_async_file_job_succeeds(make_client: ClientFactory) -> None:
+def test_async_pages_job_keeps_page_numbers(make_client: ClientFactory) -> None:
     recorder = Recorder()
     client = make_client(webhook_secret=SECRET, webhook_transport=httpx.MockTransport(recorder))
-    pdf = make_pdf(["Page one text.", "Page two text."])
 
     response = client.post(
-        "/v1/chunk/file",
-        files={"file": ("doc.pdf", pdf)},
-        data={"webhook_url": "https://example.test/hook"},
+        "/v1/chunk",
+        json={
+            "pages": [{"text": "Page one text."}, {"text": "Page two text."}],
+            "chunker": {
+                "engine": "langchain",
+                "strategy": "recursive",
+                "length_unit": "characters",
+                "chunk_size": 20,
+                "chunk_overlap": 0,
+            },
+            "webhook_url": "https://example.test/hook",
+        },
     )
 
     assert response.status_code == 202
     [event] = recorder.events()
     assert event["type"] == "chunking.completed"
+    data = event["data"]
+    assert isinstance(data, dict)
+    assert [chunk["page_numbers"] for chunk in data["chunks"]] == [[1], [2]]
 
 
 def test_webhook_url_requires_secret(make_client: ClientFactory) -> None:
@@ -172,10 +200,13 @@ def test_validation_happens_before_accepting_a_job(make_client: ClientFactory) -
     client = make_client(webhook_secret=SECRET, webhook_transport=httpx.MockTransport(recorder))
 
     response = client.post(
-        "/v1/chunk/file",
-        files={"file": ("virus.exe", b"MZ")},
-        data={"webhook_url": "https://example.test/hook"},
+        "/v1/chunk",
+        json={
+            "text": "hello",
+            "chunker": {"engine": "chonkie", "strategy": "semantic"},
+            "webhook_url": "https://example.test/hook",
+        },
     )
 
-    assert response.status_code == 415
+    assert response.status_code == 400  # no embeddings model configured
     assert recorder.requests == []

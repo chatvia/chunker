@@ -1,10 +1,16 @@
 from functools import lru_cache
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import Field, NonNegativeInt, PositiveFloat, PositiveInt, SecretStr, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from app.webhooks import decode_secret
+
+DEFAULT_CODE_LANGUAGES = (
+    "bash", "c", "cpp", "csharp", "css", "dart", "go", "html", "java", "javascript", "json",
+    "kotlin", "lua", "markdown", "php", "python", "ruby", "rust", "scala", "sql", "swift", "tsx",
+    "typescript", "yaml",
+)  # fmt: skip
 
 
 class Settings(BaseSettings):
@@ -19,12 +25,13 @@ class Settings(BaseSettings):
 
     host: str = "127.0.0.1"
     port: PositiveInt = 8000
+    workers: PositiveInt = 1
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
 
     api_key: SecretStr | None = Field(
         default=None, description="When set, /v1 endpoints require `Authorization: Bearer <key>`."
     )
-    max_upload_mb: PositiveInt = 50
+    max_request_mb: PositiveInt = 50
 
     # Any OpenAI-compatible embeddings API: OpenAI, Mistral, Ollama, vLLM, TEI, LM Studio, ...
     embeddings_base_url: str = "https://api.openai.com/v1"
@@ -34,6 +41,15 @@ class Settings(BaseSettings):
     embeddings_batch_size: PositiveInt = 64
     embeddings_timeout: PositiveFloat = 60.0
     embeddings_max_retries: NonNegativeInt = 2
+    allow_request_embeddings: bool = Field(
+        default=True,
+        description="Accept `embeddings` in requests when EMBEDDINGS_MODEL is unset.",
+    )
+
+    code_languages: Annotated[list[str], NoDecode] = Field(
+        default=list(DEFAULT_CODE_LANGUAGES),
+        description="Tree-sitter grammars installed by `chunker warmup` for the code strategies.",
+    )
 
     webhook_secret: SecretStr | None = Field(
         default=None,
@@ -43,6 +59,13 @@ class Settings(BaseSettings):
     webhook_max_attempts: PositiveInt = 3
     webhook_verify_tls: bool = True
 
+    @field_validator("code_languages", mode="before")
+    @classmethod
+    def _split_languages(cls, value: object) -> object:
+        if isinstance(value, str):
+            return [language.strip() for language in value.split(",") if language.strip()]
+        return value
+
     @field_validator("webhook_secret")
     @classmethod
     def _validate_webhook_secret(cls, value: SecretStr | None) -> SecretStr | None:
@@ -51,8 +74,8 @@ class Settings(BaseSettings):
         return value
 
     @property
-    def max_upload_bytes(self) -> int:
-        return self.max_upload_mb * 1024 * 1024
+    def max_request_bytes(self) -> int:
+        return self.max_request_mb * 1024 * 1024
 
 
 @lru_cache

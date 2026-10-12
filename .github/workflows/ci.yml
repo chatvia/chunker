@@ -4,7 +4,14 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    - cron: "0 6 * * 1" # weekly, to catch newly disclosed vulnerabilities
   workflow_call:
+    inputs:
+      skip_docker:
+        description: Skip the Docker build (the release workflow builds every platform itself).
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -15,8 +22,8 @@ concurrency:
 
 jobs:
   lint:
-    name: Lint & type check
-    runs-on: ubuntu-latest
+    name: Lint & static analysis
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -30,18 +37,14 @@ jobs:
       - name: Install dependencies
         run: uv sync --locked
 
-      - name: Check formatting
-        run: uv run ruff format --check .
-
-      - name: Lint
-        run: uv run ruff check --output-format=github .
-
-      - name: Type check
-        run: uv run mypy app tests
+      # ruff, mypy --strict, uv.lock, hadolint, shellcheck, actionlint, zizmor and file hygiene:
+      # the same hooks developers run locally (see .pre-commit-config.yaml).
+      - name: Run pre-commit hooks
+        run: uvx pre-commit@4.6.2 run --all-files --show-diff-on-failure --color=always
 
   test:
     name: Tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -55,5 +58,57 @@ jobs:
       - name: Install dependencies
         run: uv sync --locked
 
-      - name: Run tests
-        run: uv run pytest
+      - name: Download tokenizer files and code grammars
+        run: uv run chunker warmup
+
+      - name: Run tests with coverage
+        run: uv run pytest --cov --cov-report=term
+
+      - name: Coverage summary
+        if: ${{ !cancelled() }}
+        run: uv run coverage report --format=markdown >> "$GITHUB_STEP_SUMMARY"
+
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          enable-cache: true
+
+      # GHSA-8mgp-746c-j5xp (nltk, pulled in by llama-index-core) has no fixed release yet and
+      # concerns NLTK data-loading APIs this service does not expose; it fails again once fixed.
+      - name: Audit locked dependencies
+        run: >-
+          uv audit --locked --preview-features audit-command
+          --ignore-until-fixed GHSA-8mgp-746c-j5xp
+
+  docker:
+    name: Docker image
+    if: ${{ !inputs.skip_docker }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          load: true
+          push: false
+          tags: chunker:ci
+          cache-from: type=gha,scope=ci
+          cache-to: type=gha,scope=ci,mode=max
+
+      - name: Smoke test
+        run: scripts/smoke-test.sh chunker:ci

@@ -3,10 +3,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 
 class BodySizeLimitMiddleware:
-    """Reject requests whose declared Content-Length exceeds a limit before reading the body.
-
-    Multipart uploads are otherwise spooled to disk in full before the endpoint can check them.
-    """
+    """Reject requests whose declared Content-Length exceeds a limit before reading the body."""
 
     def __init__(self, app: ASGIApp, max_bytes: int) -> None:
         self.app = app

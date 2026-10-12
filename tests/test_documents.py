@@ -1,22 +1,14 @@
-from app.engines.base import Element, ParsedDocument
+from app.engines.base import Document, Page
 
 
-def test_text_joins_non_empty_elements() -> None:
-    document = ParsedDocument(
-        elements=[Element("one", page_number=1), Element(""), Element("two", page_number=2)]
-    )
+def test_text_joins_non_empty_pages() -> None:
+    document = Document(pages=[Page("one", 1), Page(""), Page("two", 3)])
 
     assert document.text == "one\n\ntwo"
 
 
-def test_page_numbers_cover_overlapping_elements() -> None:
-    document = ParsedDocument(
-        elements=[
-            Element("a" * 10, page_number=1),
-            Element("b" * 10, page_number=2),
-            Element("c" * 10, page_number=3),
-        ]
-    )
+def test_page_numbers_cover_overlapping_pages() -> None:
+    document = Document.from_pages([("a" * 10, 1), ("b" * 10, 2), ("c" * 10, 3)])
     # Layout: page 1 = [0, 10), page 2 = [12, 22), page 3 = [24, 34)
 
     assert document.page_numbers(0, 10) == [1]
@@ -25,5 +17,5 @@ def test_page_numbers_cover_overlapping_elements() -> None:
     assert document.page_numbers(30, 34) == [3]
 
 
-def test_page_numbers_empty_without_pages() -> None:
-    assert ParsedDocument.from_text("plain text").page_numbers(0, 5) == []
+def test_page_numbers_empty_for_plain_text() -> None:
+    assert Document.from_text("plain text").page_numbers(0, 5) == []

@@ -1,11 +1,6 @@
-"""Chunker: a stateless HTTP API for RAG document parsing, chunking and embeddings."""
+"""Chunker: a stateless HTTP API for RAG text chunking and embeddings."""
 
-import os
 from importlib.metadata import PackageNotFoundError, version
-
-# Unstructured sends anonymous usage analytics on import unless explicitly opted out.
-os.environ.setdefault("SCARF_NO_ANALYTICS", "true")
-os.environ.setdefault("DO_NOT_TRACK", "true")
 
 try:
     __version__ = version("chunker")

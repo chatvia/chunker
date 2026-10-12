@@ -4,9 +4,9 @@ from typing import get_args
 from fastapi import APIRouter
 from pydantic import BaseModel
 
-from app.dependencies import EmbedderDep
-from app.engines import CHUNKERS, PARSERS
-from app.schemas import ChunkerInfo, EmbeddingsInfo, EnginesResponse, ParserInfo
+from app.dependencies import EmbedderDep, SettingsDep
+from app.engines import CHUNKERS
+from app.schemas import ChunkerInfo, EmbeddingsInfo, EnginesResponse
 from app.tokens import ENCODINGS
 
 router = APIRouter(prefix="/v1", tags=["engines"])
@@ -21,18 +21,9 @@ def _description(model: type[BaseModel]) -> str:
     return inspect.cleandoc(model.__doc__ or "")
 
 
-@router.get("/engines", summary="List parsers, chunking strategies and their options")
-async def list_engines(embedder: EmbedderDep) -> EnginesResponse:
+@router.get("/engines", summary="List chunking strategies and their options")
+async def list_engines(settings: SettingsDep, embedder: EmbedderDep) -> EnginesResponse:
     return EnginesResponse(
-        parsers=[
-            ParserInfo(
-                engine=_literal(parser, "engine"),
-                description=_description(parser),
-                extensions=sorted(parser.extensions),
-                options=parser.model_json_schema(),
-            )
-            for parser in PARSERS
-        ],
         chunkers=[
             ChunkerInfo(
                 engine=_literal(chunker, "engine"),
@@ -45,6 +36,8 @@ async def list_engines(embedder: EmbedderDep) -> EnginesResponse:
         ],
         encodings=list(ENCODINGS),
         embeddings=EmbeddingsInfo(
-            configured=embedder is not None, model=embedder.model if embedder else None
+            configured=embedder is not None,
+            model=embedder.model if embedder else None,
+            per_request=embedder is None and settings.allow_request_embeddings,
         ),
     )

@@ -1,18 +1,28 @@
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, HttpUrl
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl, model_validator
 
-from app.engines import DEFAULT_TEXT_CHUNKER, ChunkerConfig
+from app.embeddings import EmbeddingsConfig
+from app.engines import DEFAULT_CHUNKER, ChunkerConfig, Document
 from app.tokens import DEFAULT_ENCODING, Encoding
 
 MAX_TEXT_LENGTH = 10_000_000
+MAX_PAGES = 10_000
 MAX_EMBED_INPUTS = 2048
 
-PARSER_FORM_HELP = 'Parser as JSON. Default: {"engine": "unstructured", "strategy": "fast"}'
-CHUNKER_FORM_HELP = 'Chunker as JSON. Default: {"engine": "unstructured", "strategy": "by_title"}'
+
+class PageIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    text: str = Field(description="The page's text or Markdown, e.g. from an OCR service.")
+    page_number: int | None = Field(
+        default=None, ge=1, description="Defaults to the page's position in `pages` (1-based)."
+    )
 
 
-class ChunkTextRequest(BaseModel):
+class ChunkRequest(BaseModel):
+    """Send either `text`, or `pages` to know which pages each chunk comes from."""
+
     model_config = ConfigDict(
         extra="forbid",
         json_schema_extra={
@@ -20,19 +30,34 @@ class ChunkTextRequest(BaseModel):
                 {
                     "text": "Long text to split...",
                     "chunker": {"engine": "llamaindex", "strategy": "sentence", "chunk_size": 256},
-                    "embed": False,
-                }
+                },
+                {
+                    "pages": [{"text": "# Page one\n\n..."}, {"text": "Page two..."}],
+                    "chunker": {"engine": "chonkie", "strategy": "semantic", "threshold": 0.75},
+                    "embed": True,
+                    "embeddings": {
+                        "base_url": "https://api.openai.com/v1",
+                        "api_key": "sk-...",
+                        "model": "text-embedding-3-small",
+                    },
+                },
             ]
         },
     )
 
-    text: str = Field(min_length=1, max_length=MAX_TEXT_LENGTH)
-    chunker: ChunkerConfig = Field(default=DEFAULT_TEXT_CHUNKER)
+    text: str | None = Field(default=None, min_length=1, max_length=MAX_TEXT_LENGTH)
+    pages: list[PageIn] | None = Field(default=None, min_length=1, max_length=MAX_PAGES)
+    chunker: ChunkerConfig = Field(default=DEFAULT_CHUNKER)
     encoding: Encoding = Field(
         default=DEFAULT_ENCODING,
         description="tiktoken encoding used by token-based strategies and for `token_count`.",
     )
-    embed: bool = Field(default=False, description="Embed each chunk with the server's model.")
+    embed: bool = Field(default=False, description="Return an embedding for every chunk.")
+    embeddings: EmbeddingsConfig | None = Field(
+        default=None,
+        description="Embeddings provider for semantic strategies and `embed`, when the server "
+        "has none configured.",
+    )
     webhook_url: HttpUrl | None = Field(
         default=None,
         description="Process asynchronously: respond 202 with a `job_id` and POST the result here.",
@@ -42,13 +67,32 @@ class ChunkTextRequest(BaseModel):
         description="Opaque data echoed back in the response and webhook, e.g. your own IDs.",
     )
 
+    @model_validator(mode="after")
+    def _check_input(self) -> Self:
+        if (self.text is None) == (self.pages is None):
+            raise ValueError("send exactly one of `text` or `pages`")
+        if self.pages is not None:
+            if not any(page.text.strip() for page in self.pages):
+                raise ValueError("`pages` contain no text")
+            if sum(len(page.text) for page in self.pages) > MAX_TEXT_LENGTH:
+                raise ValueError(f"`pages` exceed {MAX_TEXT_LENGTH} characters in total")
+        return self
+
+    def document(self) -> Document:
+        if self.pages is None:
+            return Document.from_text(self.text or "")
+        return Document.from_pages(
+            (page.text, page.page_number or position)
+            for position, page in enumerate(self.pages, start=1)
+        )
+
 
 class ChunkOut(BaseModel):
     index: int
     text: str
     token_count: int
     start_index: int | None = Field(
-        default=None, description="Character offset in the (parsed) document text."
+        default=None, description="Character offset in the input text (pages joined by \\n\\n)."
     )
     end_index: int | None = None
     page_numbers: list[int] = Field(default_factory=list)
@@ -57,10 +101,9 @@ class ChunkOut(BaseModel):
 
 
 class DocumentInfo(BaseModel):
-    filename: str | None = None
-    content_type: str | None = None
     characters: int
     token_count: int
+    pages: int | None = None
 
 
 class StrategyInfo(BaseModel):
@@ -69,7 +112,6 @@ class StrategyInfo(BaseModel):
 
 
 class ChunkResponse(BaseModel):
-    parser: str | None = Field(default=None, description="Parser engine, for file requests.")
     chunker: StrategyInfo
     document: DocumentInfo
     total_chunks: int
@@ -83,25 +125,14 @@ class JobAccepted(BaseModel):
     status: Literal["accepted"] = "accepted"
 
 
-class ElementOut(BaseModel):
-    text: str
-    type: str
-    page_number: int | None = None
-    metadata: dict[str, Any] = Field(default_factory=dict)
-
-
-class ParseResponse(BaseModel):
-    parser: str
-    document: DocumentInfo
-    text: str = Field(description="All element texts joined by blank lines.")
-    elements: list[ElementOut]
-
-
 class EmbedRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     input: list[Annotated[str, Field(min_length=1)]] = Field(
         min_length=1, max_length=MAX_EMBED_INPUTS
+    )
+    embeddings: EmbeddingsConfig | None = Field(
+        default=None, description="Embeddings provider, when the server has none configured."
     )
 
 
@@ -115,13 +146,6 @@ class EmbedResponse(BaseModel):
     data: list[EmbeddingOut]
 
 
-class ParserInfo(BaseModel):
-    engine: str
-    description: str
-    extensions: list[str]
-    options: dict[str, Any] = Field(description="JSON Schema of the parser's options.")
-
-
 class ChunkerInfo(BaseModel):
     engine: str
     strategy: str
@@ -130,13 +154,36 @@ class ChunkerInfo(BaseModel):
     options: dict[str, Any] = Field(description="JSON Schema of the strategy's options.")
 
 
+class TokensRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    input: list[str] = Field(min_length=1, max_length=MAX_EMBED_INPUTS)
+    encoding: Encoding = DEFAULT_ENCODING
+
+    @model_validator(mode="after")
+    def _check_length(self) -> Self:
+        if sum(len(text) for text in self.input) > MAX_TEXT_LENGTH:
+            raise ValueError(f"`input` exceeds {MAX_TEXT_LENGTH} characters in total")
+        return self
+
+
+class TokenCount(BaseModel):
+    index: int
+    tokens: int
+
+
+class TokensResponse(BaseModel):
+    encoding: str
+    data: list[TokenCount]
+
+
 class EmbeddingsInfo(BaseModel):
-    configured: bool
+    configured: bool = Field(description="An embeddings model is configured on the server.")
     model: str | None = None
+    per_request: bool = Field(description="Requests may bring their own `embeddings` provider.")
 
 
 class EnginesResponse(BaseModel):
-    parsers: list[ParserInfo]
     chunkers: list[ChunkerInfo]
     encodings: list[str]
     embeddings: EmbeddingsInfo

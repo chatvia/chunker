@@ -1,19 +1,21 @@
 import asyncio
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
+from contextlib import asynccontextmanager
 from itertools import batched
 from typing import Protocol, Self
 
 import openai
 from openai.types import CreateEmbeddingResponse
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl, PositiveInt, SecretStr
 
 from app.config import Settings
-from app.errors import UpstreamError
+from app.errors import ChunkerError, NotConfiguredError, UpstreamError
 
 _MAX_CONCURRENT_BATCHES = 4
 
 
 class Embedder(Protocol):
-    """Embeds texts with the server-configured model. Shared by every engine adapter."""
+    """Embeds texts with the configured model. Shared by every engine adapter."""
 
     @property
     def model(self) -> str: ...
@@ -119,3 +121,61 @@ def _upstream_error(exc: openai.APIError) -> UpstreamError:
         f"Embeddings provider returned HTTP {status}" if status else "Embeddings request failed"
     )
     return UpstreamError(f"{prefix}: {exc.message}")
+
+
+class EmbeddingsConfig(BaseModel):
+    """An OpenAI-compatible embeddings provider supplied with the request.
+
+    Only accepted when the server has no EMBEDDINGS_MODEL of its own."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    base_url: HttpUrl = Field(
+        default=HttpUrl("https://api.openai.com/v1"),
+        description="OpenAI-compatible API root, e.g. https://api.mistral.ai/v1.",
+    )
+    api_key: SecretStr | None = Field(default=None, description="Sent as a Bearer token.")
+    model: str = Field(min_length=1, examples=["text-embedding-3-small"])
+    dimensions: PositiveInt | None = Field(
+        default=None, description="Request shorter vectors, if the model supports it."
+    )
+    batch_size: int = Field(default=64, ge=1, le=2048, description="Texts per API call.")
+
+
+def check_request_embeddings(
+    config: EmbeddingsConfig | None, server: Embedder | None, settings: Settings
+) -> None:
+    """Server configuration wins; requests may only bring a provider when there is none."""
+    if config is None:
+        return
+    if server is not None:
+        raise ChunkerError(
+            "Embeddings are configured on this server; remove `embeddings` from the request."
+        )
+    if not settings.allow_request_embeddings:
+        raise NotConfiguredError(
+            "This server does not accept `embeddings` in requests (ALLOW_REQUEST_EMBEDDINGS)."
+        )
+
+
+@asynccontextmanager
+async def resolve_embedder(
+    config: EmbeddingsConfig | None, server: Embedder | None, settings: Settings
+) -> AsyncIterator[Embedder | None]:
+    """Yield the request's embedder (closed afterwards) or the server's."""
+    if config is None:
+        yield server
+        return
+    embedder = OpenAICompatibleEmbedder(
+        model=config.model,
+        base_url=str(config.base_url),
+        api_key=config.api_key.get_secret_value() if config.api_key else None,
+        dimensions=config.dimensions,
+        batch_size=config.batch_size,
+        timeout=settings.embeddings_timeout,
+        max_retries=settings.embeddings_max_retries,
+    )
+    try:
+        yield embedder
+    finally:
+        await embedder.aclose()

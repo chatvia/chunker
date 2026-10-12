@@ -38,22 +38,23 @@ def test_engines_lists_every_strategy_with_its_schema(client: TestClient) -> Non
     body = client.get("/v1/engines").json()
 
     strategies = {(c["engine"], c["strategy"]) for c in body["chunkers"]}
-    assert len(strategies) == len(CHUNKERS) == 14
+    assert len(strategies) == len(CHUNKERS) == 27
     assert {("chonkie", "semantic"), ("llamaindex", "semantic")} == {
         (c["engine"], c["strategy"]) for c in body["chunkers"] if c["requires_embeddings"]
     }
     assert all(c["description"] and c["options"]["properties"] for c in body["chunkers"])
-    parsers = {p["engine"]: p for p in body["parsers"]}
-    assert set(parsers) == {"unstructured", "llamaindex"}
-    assert ".pdf" in parsers["unstructured"]["extensions"]
-    assert body["embeddings"] == {"configured": True, "model": "fake-embedding"}
+    assert body["embeddings"] == {
+        "configured": True,
+        "model": "fake-embedding",
+        "per_request": False,
+    }
     assert "cl100k_base" in body["encodings"]
 
 
 def test_engines_reports_missing_embeddings(bare_client: TestClient) -> None:
     body = bare_client.get("/v1/engines").json()
 
-    assert body["embeddings"] == {"configured": False, "model": None}
+    assert body["embeddings"] == {"configured": False, "model": None, "per_request": True}
 
 
 def test_embed_returns_vectors_in_order(client: TestClient) -> None:
@@ -86,6 +87,50 @@ def test_settings_reject_malformed_webhook_secret() -> None:
 def test_openapi_schema_builds(client: TestClient) -> None:
     schema = client.get("/openapi.json").json()
 
-    assert {"/v1/chunk", "/v1/chunk/file", "/v1/parse", "/v1/embed", "/v1/engines"} <= set(
-        schema["paths"]
-    )
+    assert set(schema["paths"]) == {
+        "/health",
+        "/v1/chunk",
+        "/v1/embed",
+        "/v1/engines",
+        "/v1/tokens",
+    }
+
+
+def test_oversized_requests_are_rejected_before_reading(make_client: ClientFactory) -> None:
+    client = make_client(max_request_mb=1)
+
+    response = client.post("/v1/chunk", json={"text": "a" * (2 * 1024 * 1024)})
+
+    assert response.status_code == 413
+    assert "1 MB" in response.json()["detail"]
+
+
+def test_tokens_counts_each_input(client: TestClient) -> None:
+    response = client.post("/v1/tokens", json={"input": ["hello world", "", "a <|endoftext|> b"]})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["encoding"] == "cl100k_base"
+    assert [item["index"] for item in body["data"]] == [0, 1, 2]
+    assert [item["tokens"] for item in body["data"]][:2] == [2, 0]
+    assert body["data"][2]["tokens"] > 3  # special tokens are counted as plain text
+
+
+def test_tokens_uses_the_requested_encoding(client: TestClient) -> None:
+    text = "Tokenizers disagree about how to split unusual words like antidisestablishmentarianism."
+    counts = {
+        encoding: client.post("/v1/tokens", json={"input": [text], "encoding": encoding}).json()[
+            "data"
+        ][0]["tokens"]
+        for encoding in ("cl100k_base", "o200k_base", "r50k_base")
+    }
+
+    assert len(set(counts.values())) > 1
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [{"input": []}, {"input": ["x"], "encoding": "nope"}, {"input": ["x"] * 2049}, {"input": "x"}],
+)
+def test_tokens_validates_input(client: TestClient, payload: dict[str, object]) -> None:
+    assert client.post("/v1/tokens", json=payload).status_code == 422

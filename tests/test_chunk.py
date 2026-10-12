@@ -1,8 +1,9 @@
-from typing import Any
+from typing import Any, get_args
 
 import pytest
 from fastapi.testclient import TestClient
 
+from app.engines import CHUNKERS
 from tests.conftest import TWO_TOPICS, FakeEmbedder
 
 ARTICLE = "\n\n".join(
@@ -29,8 +30,23 @@ STRATEGIES: list[dict[str, Any]] = [
     {"engine": "chonkie", "strategy": "token", "chunk_size": 40, "chunk_overlap": 8},
     {"engine": "chonkie", "strategy": "sentence", "chunk_size": 40},
     {"engine": "chonkie", "strategy": "recursive", "chunk_size": 40},
-    {"engine": "unstructured", "strategy": "basic", "max_characters": 200},
-    {"engine": "unstructured", "strategy": "by_title", "max_characters": 200},
+    {"engine": "langchain", "strategy": "nltk", "chunk_size": 40, "chunk_overlap": 0},
+    {"engine": "langchain", "strategy": "js_framework", "chunk_size": 60, "chunk_overlap": 0},
+    {"engine": "langchain", "strategy": "markdown_syntax"},
+    {"engine": "llamaindex", "strategy": "sentence_window", "window_size": 1},
+    {
+        "engine": "llamaindex",
+        "strategy": "hierarchical",
+        "chunk_sizes": [64, 32],
+        "chunk_overlap": 0,
+    },
+    {"engine": "chonkie", "strategy": "fast", "chunk_size": 200},
+    {
+        "engine": "chonkie",
+        "strategy": "recursive",
+        "chunk_size": 40,
+        "levels": [{"delimiters": ["\n\n"]}, {"delimiters": [". "]}, {"whitespace": True}],
+    },
 ]
 
 
@@ -56,17 +72,23 @@ def test_every_strategy_chunks_text(client: TestClient, chunker: dict[str, Any])
             assert ARTICLE[chunk["start_index"] : chunk["end_index"]] == chunk["text"]
 
 
-@pytest.mark.parametrize(
-    "chunker",
-    [s for s in STRATEGIES if s["engine"] != "unstructured" and s["strategy"] != "markdown"],
-    ids=_id,
-)
+def _verbatim(config: dict[str, Any]) -> bool:
+    for model in CHUNKERS:
+        engine = get_args(model.model_fields["engine"].annotation)
+        strategy = get_args(model.model_fields["strategy"].annotation)
+        if (engine, strategy) == ((config["engine"],), (config["strategy"],)):
+            return model.verbatim
+    raise AssertionError(f"unknown strategy {config}")
+
+
+@pytest.mark.parametrize("chunker", [s for s in STRATEGIES if _verbatim(s)], ids=_id)
 def test_verbatim_strategies_report_offsets(client: TestClient, chunker: dict[str, Any]) -> None:
     body = client.post("/v1/chunk", json={"text": ARTICLE, "chunker": chunker}).json()
 
     starts = [chunk["start_index"] for chunk in body["chunks"]]
     assert None not in starts
-    assert starts == sorted(starts)
+    if chunker["strategy"] != "hierarchical":  # emits every level, largest first
+        assert starts == sorted(starts)
 
 
 def test_default_chunker_is_langchain_recursive(client: TestClient) -> None:
@@ -121,7 +143,8 @@ def test_semantic_strategies_use_server_embeddings(
 ) -> None:
     chunker: dict[str, Any] = {"engine": engine, "strategy": "semantic"}
     if engine == "llamaindex":
-        chunker |= {"buffer_size": 0, "breakpoint_percentile_threshold": 50}
+        # Only the topic shift is above the 90th percentile of sentence distances.
+        chunker |= {"buffer_size": 0, "breakpoint_percentile_threshold": 90}
 
     response = client.post("/v1/chunk", json={"text": TWO_TOPICS, "chunker": chunker})
 
@@ -176,11 +199,77 @@ def test_embed_requires_embeddings(bare_client: TestClient) -> None:
         {"text": "hi", "chunker": {"engine": "chonkie", "strategy": "nope"}},
         {"text": "hi", "chunker": {"engine": "chonkie", "strategy": "token", "chunk_overlap": 600}},
         {"text": "hi", "chunker": {"engine": "langchain", "strategy": "token", "typo": 1}},
-        {"text": "hi", "chunker": {"engine": "unstructured", "strategy": "basic", "overlap": 5000}},
+        {"text": "hi", "chunker": {"engine": "unstructured", "strategy": "basic"}},
         {"text": "hi", "encoding": "unknown"},
         {"text": "hi", "webhook_url": "not-a-url"},
         {"text": "hi", "unexpected": True},
     ],
 )
 def test_invalid_requests_are_rejected(client: TestClient, payload: dict[str, Any]) -> None:
+    assert client.post("/v1/chunk", json=payload).status_code == 422
+
+
+PAGES = [
+    {"text": "Page one introduces the topic. It has two short sentences."},
+    {"text": "   "},
+    {"text": "Page three continues the topic. It also has two sentences."},
+]
+# Small enough that no chunk crosses a page break.
+PAGE_CHUNKER = {
+    "engine": "langchain",
+    "strategy": "recursive",
+    "length_unit": "characters",
+    "chunk_size": 20,
+    "chunk_overlap": 0,
+}
+
+
+def test_pages_map_chunks_to_page_numbers(client: TestClient) -> None:
+    body = client.post("/v1/chunk", json={"pages": PAGES, "chunker": PAGE_CHUNKER}).json()
+
+    assert body["document"]["pages"] == 3
+    pages = [chunk["page_numbers"] for chunk in body["chunks"]]
+    assert pages[0] == [1]
+    assert pages[-1] == [3]  # the blank page keeps its position
+    joined = "\n\n".join(page["text"] for page in PAGES if page["text"])
+    for chunk in body["chunks"]:
+        assert joined[chunk["start_index"] : chunk["end_index"]] == chunk["text"]
+
+
+def test_chunks_spanning_pages_list_every_page(client: TestClient) -> None:
+    chunker = {"engine": "langchain", "strategy": "token", "chunk_size": 500, "chunk_overlap": 0}
+
+    body = client.post("/v1/chunk", json={"pages": PAGES, "chunker": chunker}).json()
+
+    assert [chunk["page_numbers"] for chunk in body["chunks"]] == [[1, 2, 3]]
+
+
+def test_explicit_page_numbers_are_kept(client: TestClient) -> None:
+    pages = [{"text": "Fifth page text.", "page_number": 5}, {"text": "Sixth page text."}]
+
+    body = client.post("/v1/chunk", json={"pages": pages, "chunker": PAGE_CHUNKER}).json()
+
+    # Pages without a number fall back to their position.
+    assert [chunk["page_numbers"] for chunk in body["chunks"]] == [[5], [2]]
+
+
+def test_text_has_no_page_numbers(client: TestClient) -> None:
+    body = client.post("/v1/chunk", json={"text": ARTICLE}).json()
+
+    assert body["document"]["pages"] is None
+    assert all(chunk["page_numbers"] == [] for chunk in body["chunks"])
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"text": "hi", "pages": [{"text": "hi"}]},
+        {"pages": []},
+        {"pages": [{"text": " "}, {"text": ""}]},
+        {"pages": [{"text": "hi", "page_number": 0}]},
+        {"pages": [{"text": "hi", "image": "x"}]},
+    ],
+)
+def test_invalid_page_requests_are_rejected(client: TestClient, payload: dict[str, Any]) -> None:
     assert client.post("/v1/chunk", json=payload).status_code == 422

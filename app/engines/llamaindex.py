@@ -1,71 +1,35 @@
-"""Parser and chunkers backed by LlamaIndex (`llama-index-core`, `llama-index-readers-file`)."""
+"""Chunkers backed by LlamaIndex node parsers (`llama-index-core`)."""
 
-import tempfile
-from pathlib import Path
+import json
 from typing import Annotated, Any, ClassVar, Literal, Self
 
-from llama_index.core import Document, SimpleDirectoryReader
+from llama_index.core import Document as LlamaDocument
 from llama_index.core.base.embeddings.base import BaseEmbedding, Embedding
 from llama_index.core.node_parser import (
+    CodeSplitter,
+    HierarchicalNodeParser,
+    HTMLNodeParser,
+    JSONNodeParser,
     MarkdownNodeParser,
     NodeParser,
     SemanticSplitterNodeParser,
     SentenceSplitter,
+    SentenceWindowNodeParser,
     TokenTextSplitter,
 )
-from llama_index.core.schema import TextNode
+from llama_index.core.node_parser.text.sentence import CHUNKING_REGEX
+from llama_index.core.schema import NodeRelationship, TextNode
 from pydantic import Field, PrivateAttr, model_validator
 
 from app.embeddings import Embedder
-from app.engines.base import (
-    ChunkContext,
-    ChunkerBase,
-    Element,
-    ParsedDocument,
-    ParserBase,
-    RawChunk,
-)
+from app.engines import grammars
+from app.engines.base import ChunkContext, ChunkerBase, Document, RawChunk
+from app.errors import InvalidInputError
 from app.tokens import get_encoding
-
-# Reader metadata that leaks server paths or is meaningless for an uploaded file.
-_DROPPED_METADATA = frozenset(
-    {"file_path", "file_name", "creation_date", "last_modified_date", "last_accessed_date"}
-)
-
-
-class LlamaIndexParser(ParserBase):
-    """Parse files with LlamaIndex's `SimpleDirectoryReader` (one element per page for PDFs)."""
-
-    engine: Literal["llamaindex"]
-
-    extensions: ClassVar[frozenset[str]] = frozenset(
-        {".pdf", ".docx", ".pptx", ".xlsx", ".xls", ".csv", ".md", ".txt", ".ipynb"}
-    )
-
-    def parse(self, data: bytes, filename: str) -> ParsedDocument:
-        suffix = Path(filename).suffix.lower()
-        with tempfile.TemporaryDirectory(prefix="chunker-") as tmp:
-            path = Path(tmp) / f"upload{suffix}"
-            path.write_bytes(data)
-            documents = SimpleDirectoryReader(input_files=[path], raise_on_error=True).load_data()
-
-        elements = []
-        for document in documents:
-            metadata = {k: v for k, v in document.metadata.items() if k not in _DROPPED_METADATA}
-            page_label = str(metadata.get("page_label", ""))
-            elements.append(
-                Element(
-                    text=document.text,
-                    type="Document",
-                    page_number=int(page_label) if page_label.isdigit() else None,
-                    metadata=metadata,
-                )
-            )
-        return ParsedDocument(elements=elements, filename=filename)
 
 
 class _EmbedderAdapter(BaseEmbedding):
-    """Exposes the server-configured embedder as a LlamaIndex embedding model."""
+    """Exposes the configured embedder as a LlamaIndex embedding model."""
 
     _embedder: Embedder = PrivateAttr()
 
@@ -92,8 +56,13 @@ class _LlamaIndexChunker(ChunkerBase):
     def _node_parser(self, context: ChunkContext) -> NodeParser:
         raise NotImplementedError
 
-    def chunk(self, document: ParsedDocument, context: ChunkContext) -> list[RawChunk]:
-        nodes = self._node_parser(context).get_nodes_from_documents([Document(text=document.text)])
+    def _nodes(self, document: Document, context: ChunkContext) -> list[TextNode]:
+        nodes = self._node_parser(context).get_nodes_from_documents(
+            [LlamaDocument(text=document.text)]
+        )
+        return [node for node in nodes if isinstance(node, TextNode)]
+
+    def chunk(self, document: Document, context: ChunkContext) -> list[RawChunk]:
         return [
             RawChunk(
                 text=node.get_content(),
@@ -101,8 +70,7 @@ class _LlamaIndexChunker(ChunkerBase):
                 end_index=node.end_char_idx,
                 metadata=dict(node.metadata),
             )
-            for node in nodes
-            if isinstance(node, TextNode)
+            for node in self._nodes(document, context)
         ]
 
 
@@ -118,14 +86,24 @@ class _SizedChunker(_LlamaIndexChunker):
 
 
 class LlamaIndexSentence(_SizedChunker):
-    """Split into chunks of whole sentences up to `chunk_size` tokens (`SentenceSplitter`)."""
+    """Split into chunks of whole sentences up to `chunk_size` tokens, preferring paragraph
+    boundaries (`SentenceSplitter`)."""
 
     strategy: Literal["sentence"]
+    separator: str = Field(default=" ", description="Word separator.")
+    paragraph_separator: str = "\n\n\n"
+    secondary_chunking_regex: str | None = Field(
+        default=CHUNKING_REGEX,
+        description="Fallback split for sentences longer than `chunk_size`.",
+    )
 
     def _node_parser(self, context: ChunkContext) -> NodeParser:
         return SentenceSplitter(
             chunk_size=self.chunk_size,
             chunk_overlap=self.chunk_overlap,
+            separator=self.separator,
+            paragraph_separator=self.paragraph_separator,
+            secondary_chunking_regex=self.secondary_chunking_regex,
             tokenizer=get_encoding(context.encoding).encode,
             include_prev_next_rel=False,
         )
@@ -135,11 +113,15 @@ class LlamaIndexToken(_SizedChunker):
     """Split into chunks of `chunk_size` tokens on word boundaries (`TokenTextSplitter`)."""
 
     strategy: Literal["token"]
+    separator: str = " "
+    backup_separators: list[str] = Field(default_factory=lambda: ["\n"])
 
     def _node_parser(self, context: ChunkContext) -> NodeParser:
         return TokenTextSplitter(
             chunk_size=self.chunk_size,
             chunk_overlap=self.chunk_overlap,
+            separator=self.separator,
+            backup_separators=self.backup_separators,
             tokenizer=get_encoding(context.encoding).encode,
             include_prev_next_rel=False,
         )
@@ -147,7 +129,7 @@ class LlamaIndexToken(_SizedChunker):
 
 class LlamaIndexSemantic(_LlamaIndexChunker):
     """Start a new chunk where the embedding similarity between sentence groups drops
-    (`SemanticSplitterNodeParser`). Requires the server's embeddings model."""
+    (`SemanticSplitterNodeParser`). Needs embeddings."""
 
     strategy: Literal["semantic"]
     buffer_size: int = Field(
@@ -172,12 +154,186 @@ class LlamaIndexMarkdown(_LlamaIndexChunker):
     """Split Markdown by headers (`MarkdownNodeParser`); each chunk carries its `header_path`."""
 
     strategy: Literal["markdown"]
+    header_path_separator: str = "/"
 
     def _node_parser(self, context: ChunkContext) -> NodeParser:
-        return MarkdownNodeParser(include_prev_next_rel=False)
+        return MarkdownNodeParser(
+            header_path_separator=self.header_path_separator, include_prev_next_rel=False
+        )
+
+
+class LlamaIndexSentenceWindow(_LlamaIndexChunker):
+    """One chunk per sentence; `metadata.window` holds the surrounding sentences, for
+    sentence-window retrieval (`SentenceWindowNodeParser`)."""
+
+    strategy: Literal["sentence_window"]
+    window_size: int = Field(default=3, ge=0, description="Sentences on each side of the chunk.")
+
+    def _node_parser(self, context: ChunkContext) -> NodeParser:
+        return SentenceWindowNodeParser.from_defaults(
+            window_size=self.window_size, include_prev_next_rel=False
+        )
+
+
+class LlamaIndexHierarchical(_LlamaIndexChunker):
+    """Chunk at several sizes at once (largest first) for auto-merging retrieval. Each chunk
+    has `metadata.node_id`, `parent_id` and `level` (0 = largest)."""
+
+    strategy: Literal["hierarchical"]
+    chunk_sizes: list[int] = Field(
+        default_factory=lambda: [2048, 512, 128], min_length=1, description="In tokens."
+    )
+    chunk_overlap: int = Field(default=20, ge=0, description="Token overlap at every level.")
+
+    @model_validator(mode="after")
+    def _check_sizes(self) -> Self:
+        if any(size < 1 for size in self.chunk_sizes):
+            raise ValueError("chunk_sizes must be positive")
+        if self.chunk_sizes != sorted(self.chunk_sizes, reverse=True):
+            raise ValueError("chunk_sizes must be in decreasing order")
+        if self.chunk_overlap >= min(self.chunk_sizes):
+            raise ValueError("chunk_overlap must be smaller than every chunk size")
+        return self
+
+    def _node_parser(self, context: ChunkContext) -> NodeParser:
+        tokenizer = get_encoding(context.encoding).encode
+        ids = [f"level-{level}" for level in range(len(self.chunk_sizes))]
+        parsers: dict[str, NodeParser] = {
+            parser_id: SentenceSplitter(
+                chunk_size=size,
+                chunk_overlap=self.chunk_overlap,
+                tokenizer=tokenizer,
+                include_prev_next_rel=False,
+            )
+            for parser_id, size in zip(ids, self.chunk_sizes, strict=True)
+        }
+        return HierarchicalNodeParser.from_defaults(
+            node_parser_ids=ids, node_parser_map=parsers, include_prev_next_rel=False
+        )
+
+    def chunk(self, document: Document, context: ChunkContext) -> list[RawChunk]:
+        nodes = self._nodes(document, context)
+        parents = {
+            node.node_id: parent.node_id
+            if (parent := node.relationships.get(NodeRelationship.PARENT)) is not None
+            and not isinstance(parent, list)
+            else None
+            for node in nodes
+        }
+
+        def level(node_id: str) -> int:
+            depth = 0
+            while (parent_id := parents.get(node_id)) is not None:
+                node_id, depth = parent_id, depth + 1
+            return depth
+
+        return [
+            RawChunk(
+                text=node.get_content(),
+                start_index=node.start_char_idx,
+                end_index=node.end_char_idx,
+                metadata={
+                    "node_id": node.node_id,
+                    "parent_id": parents[node.node_id],
+                    "level": level(node.node_id),
+                },
+            )
+            for node in nodes
+        ]
+
+
+class LlamaIndexHTML(_LlamaIndexChunker):
+    """One chunk per HTML element of the given `tags` (`HTMLNodeParser`); the input is HTML."""
+
+    strategy: Literal["html"]
+    tags: list[str] = Field(
+        default_factory=lambda: [
+            "p",
+            "h1",
+            "h2",
+            "h3",
+            "h4",
+            "h5",
+            "h6",
+            "li",
+            "b",
+            "i",
+            "u",
+            "section",
+        ],
+        min_length=1,
+    )
+
+    verbatim: ClassVar[bool] = False  # text is extracted from the markup
+
+    def _node_parser(self, context: ChunkContext) -> NodeParser:
+        return HTMLNodeParser(tags=self.tags, include_prev_next_rel=False)
+
+
+class LlamaIndexJSON(_LlamaIndexChunker):
+    """Flatten JSON into `path value` lines, one chunk per top-level item (`JSONNodeParser`);
+    the input must be JSON."""
+
+    strategy: Literal["json"]
+
+    verbatim: ClassVar[bool] = False
+
+    def _node_parser(self, context: ChunkContext) -> NodeParser:
+        return JSONNodeParser(include_prev_next_rel=False)
+
+    def chunk(self, document: Document, context: ChunkContext) -> list[RawChunk]:
+        try:
+            json.loads(document.text)
+        except json.JSONDecodeError as exc:
+            raise InvalidInputError(f"The input is not valid JSON: {exc}") from exc
+        return super().chunk(document, context)
+
+
+class LlamaIndexCode(_LlamaIndexChunker):
+    """Split source code along its syntax tree (functions, classes, ...) with tree-sitter
+    (`CodeSplitter`). `language` must be one of the server's CODE_LANGUAGES."""
+
+    strategy: Literal["code"]
+    language: str = Field(min_length=1, examples=["python"])
+    chunk_lines: int = Field(default=40, ge=1)
+    chunk_lines_overlap: int = Field(default=15, ge=1)
+    max_chars: int = Field(default=1500, ge=1, description="Used when `count_mode` is char.")
+    count_mode: Literal["char", "token"] = "char"
+    max_tokens: int = Field(default=512, ge=1, description="Used when `count_mode` is token.")
+
+    @model_validator(mode="after")
+    def _check_overlap(self) -> Self:
+        if self.chunk_lines_overlap >= self.chunk_lines:
+            raise ValueError("chunk_lines_overlap must be smaller than chunk_lines")
+        return self
+
+    def preflight(self, *, embeddings: bool) -> None:
+        super().preflight(embeddings=embeddings)
+        grammars.require(self.language)
+
+    def _node_parser(self, context: ChunkContext) -> NodeParser:
+        grammars.require(self.language)
+        return CodeSplitter(
+            language=self.language,
+            chunk_lines=self.chunk_lines,
+            chunk_lines_overlap=self.chunk_lines_overlap,
+            max_chars=self.max_chars,
+            count_mode=self.count_mode,
+            max_tokens=self.max_tokens,
+            tokenizer=get_encoding(context.encoding).encode,
+            include_prev_next_rel=False,
+        )
 
 
 LlamaIndexChunker = Annotated[
-    LlamaIndexSentence | LlamaIndexToken | LlamaIndexSemantic | LlamaIndexMarkdown,
+    LlamaIndexSentence
+    | LlamaIndexToken
+    | LlamaIndexSemantic
+    | LlamaIndexMarkdown
+    | LlamaIndexSentenceWindow
+    | LlamaIndexHierarchical
+    | LlamaIndexHTML
+    | LlamaIndexJSON
+    | LlamaIndexCode,
     Field(discriminator="strategy"),
 ]

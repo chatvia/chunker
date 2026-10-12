@@ -11,12 +11,13 @@ from app.dependencies import require_api_key
 from app.embeddings import Embedder, OpenAICompatibleEmbedder
 from app.errors import register_exception_handlers
 from app.middleware import BodySizeLimitMiddleware
-from app.routes import chunk, embed, engines, health, parse
+from app.routes import chunk, embed, engines, health, tokens
 from app.webhooks import WebhookSender, decode_secret
 
 DESCRIPTION = """
-Stateless HTTP API for RAG pipelines: parse documents, chunk text and compute embeddings
-with **LangChain**, **LlamaIndex**, **Unstructured** and **Chonkie** from any language.
+Stateless HTTP API for RAG pipelines: chunk text and compute embeddings with **LangChain**,
+**LlamaIndex** and **Chonkie** from any language. Parse documents elsewhere (e.g. with an OCR
+service) and send the text, or its pages, to `/v1/chunk`.
 
 Nothing is stored. Pass `webhook_url` to process asynchronously; results are POSTed back,
 signed per the [Standard Webhooks](https://standardwebhooks.com) spec.
@@ -67,11 +68,10 @@ def create_app(
 
     app.include_router(health.router)
     protected = [Depends(require_api_key)]
-    for module in (engines, parse, chunk, embed):
+    for module in (engines, chunk, embed, tokens):
         app.include_router(module.router, dependencies=protected)
 
-    # Allow some headroom over the file limit for multipart framing and form fields.
-    app.add_middleware(BodySizeLimitMiddleware, max_bytes=settings.max_upload_bytes + 1024 * 1024)
+    app.add_middleware(BodySizeLimitMiddleware, max_bytes=settings.max_request_bytes)
     return app
 
 

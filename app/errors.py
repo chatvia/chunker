@@ -12,15 +12,9 @@ class ChunkerError(Exception):
         self.detail = detail
 
 
-class FileTooLargeError(ChunkerError):
-    status_code = 413
+class InvalidInputError(ChunkerError):
+    """The input cannot be processed by the chosen strategy (e.g. invalid JSON)."""
 
-
-class UnsupportedFileTypeError(ChunkerError):
-    status_code = 415
-
-
-class ParseError(ChunkerError):
     status_code = 422
 
 

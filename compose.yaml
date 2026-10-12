@@ -1,0 +1,13 @@
+# docker compose up            -> run the published image
+# docker compose up --build    -> build from this checkout instead
+services:
+  chunker:
+    image: ghcr.io/chatvia/chunker:latest
+    build: .
+    ports:
+      - "8000:8000"
+    # Embeddings, API key, webhook secret, ... (see .env.example). Optional.
+    env_file:
+      - path: .env
+        required: false
+    restart: unless-stopped

@@ -1,30 +1,26 @@
 [project]
 name = "chunker"
 version = "0.2.0"
-description = "Stateless HTTP API for RAG document parsing, chunking and embeddings with LangChain, LlamaIndex, Unstructured and Chonkie"
+description = "Stateless HTTP API for RAG text chunking and embeddings with LangChain, LlamaIndex and Chonkie"
 readme = "README.md"
-requires-python = ">=3.13,<3.14"
+requires-python = ">=3.14"
 dependencies = [
     # HTTP API
     "fastapi>=0.143.0",
     "uvicorn[standard]>=0.54.0",
-    "python-multipart>=0.0.32",
     "pydantic>=2.14.1",
     "pydantic-settings>=2.15.0",
     "httpx>=0.28.1",
     # Engines
     "langchain-text-splitters>=1.1.3",
     "llama-index-core>=0.14.25",
-    "llama-index-readers-file>=0.7.0",
-    "docx2txt>=0.9",  # LlamaIndex .docx reader
-    "chonkie[tiktoken]>=1.7.0",
-    "unstructured[docx,md,pdf,pptx,xlsx]>=0.27.25",
-    "torch>=2.14.1",  # needed by unstructured[pdf]; declared so Linux gets CPU-only wheels
-    # spaCy model used by unstructured; pinned so it is not downloaded at runtime.
-    "en-core-web-sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl",
+    "chonkie[code,tiktoken]>=1.7.0",
     # Tokens and embeddings
     "tiktoken>=0.14.0",
     "openai>=3.29.0",
+    "beautifulsoup4>=4.15.0",
+    "lxml>=6.1.3",
+    "langchain-core>=1.6.9",
 ]
 
 [project.scripts]
@@ -34,17 +30,14 @@ chunker = "app.__main__:main"
 dev = [
     "mypy>=2.4.0",
     "pytest>=9.1.1",
+    "pytest-cov>=7.1.0",
     "ruff>=0.17.0",
 ]
 
-[tool.uv.sources]
-# unstructured[pdf] needs torch; use CPU-only wheels on Linux to avoid ~3GB of CUDA libraries.
-torch = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
-
-[[tool.uv.index]]
-name = "pytorch-cpu"
-url = "https://download.pytorch.org/whl/cpu"
-explicit = true
+[tool.uv]
+# NLTK (used by LlamaIndex and LangChain sentence splitting) refuses to read hardlinked data
+# files, and uv hardlinks from its cache by default on Linux.
+link-mode = "copy"
 
 [build-system]
 requires = ["uv_build>=0.13.0,<0.14"]
@@ -56,7 +49,7 @@ module-root = ""
 
 [tool.ruff]
 line-length = 100
-target-version = "py313"
+target-version = "py314"
 
 [tool.ruff.lint]
 select = [
@@ -65,7 +58,7 @@ select = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**" = ["S101", "S105", "S106"]
+"tests/**" = ["S101", "S104", "S105", "S106"]
 
 [tool.mypy]
 strict = true
@@ -74,3 +67,12 @@ plugins = ["pydantic.mypy"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = ["-ra", "--strict-markers", "--strict-config"]
+
+[tool.coverage.run]
+source = ["app"]
+branch = true
+
+[tool.coverage.report]
+fail_under = 90
+show_missing = true
+skip_covered = true
